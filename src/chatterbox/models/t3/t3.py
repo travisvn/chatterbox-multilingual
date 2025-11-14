@@ -1,26 +1,27 @@
 # Copyright (c) 2025 Resemble AI
 # MIT License
 import logging
-from typing import Union, Optional, List
-
-logger = logging.getLogger(__name__)
+import threading
+from typing import Optional
 
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 from transformers import LlamaModel, LlamaConfig
-from transformers.generation.logits_process import TopPLogitsWarper, RepetitionPenaltyLogitsProcessor, MinPLogitsWarper
+from transformers.generation.logits_process import (
+    TopPLogitsWarper,
+    RepetitionPenaltyLogitsProcessor,
+    MinPLogitsWarper,
+)
 
 from .modules.learned_pos_emb import LearnedPositionEmbeddings
-
 from .modules.cond_enc import T3CondEnc, T3Cond
 from .modules.t3_config import T3Config
 from .llama_configs import LLAMA_CONFIGS
 from .inference.t3_hf_backend import T3HuggingfaceBackend
 from .inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
 from ..utils import AttrDict
-
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +34,16 @@ def _ensure_BOT_EOT(text_tokens: Tensor, hp):
 
 class T3(nn.Module):
     """
-    Token-To-Token (T3) TTS model using huggingface transformer models as backbones,
+     Token-To-Token (T3) TTS model using huggingface transformer models as backbones,
         * tokenization, including start / stop tokens are always added externally to this class
         * conditioning data like CLAP, emotion, etc are all in a separate file for more modularity
         * careful! this class assumes relative positional encoding -- with absolute PE, we would at
             least want to reset the position to 0 when speech tokens begin, and optionally use a
             different PE embedding space for speech.
     """
-
     def __init__(self, hp=None):
         if hp is None:
-            hp = T3Config.english_only()  # Default to English-only config for backward compatibility
+            hp = T3Config.english_only() # Default to English-only config for backward compatibility
         super().__init__()
         self.hp = hp
         self.cfg = LlamaConfig(**LLAMA_CONFIGS[hp.llama_config_name])
@@ -67,7 +67,9 @@ class T3(nn.Module):
         # logit projection
         self.text_head = nn.Linear(self.cfg.hidden_size, hp.text_tokens_dict_size, bias=False)
         self.speech_head = nn.Linear(self.cfg.hidden_size, hp.speech_tokens_dict_size, bias=False)
-        self.compiled = False
+
+        # Lock for multilingual inference to prevent hook interference
+        self._multilingual_inference_lock = threading.Lock() if hp.is_multilingual else None
 
     @property
     def device(self):
@@ -76,11 +78,17 @@ class T3(nn.Module):
     def prepare_conditioning(self, t3_cond: T3Cond):
         """
         Token cond data needs to be embedded, so that needs to be here instead of in `T3CondEnc`.
+        Creates a copy of t3_cond to avoid mutating shared state across concurrent requests.
         """
+        # Clone to prevent mutation of shared t3_cond objects
+        t3_cond = t3_cond.clone()
+
         if t3_cond.cond_prompt_speech_tokens is not None and t3_cond.cond_prompt_speech_emb is None:
-            t3_cond.cond_prompt_speech_emb = self.speech_emb(t3_cond.cond_prompt_speech_tokens) + \
-                self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
-        return self.cond_enc(t3_cond)  # (B, len_cond, dim)
+            t3_cond.cond_prompt_speech_emb = (
+                self.speech_emb(t3_cond.cond_prompt_speech_tokens)
+                + self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
+            )
+        return self.cond_enc(t3_cond)
 
     def prepare_input_embeds(
         self,
@@ -94,22 +102,21 @@ class T3(nn.Module):
         cond_emb = self.prepare_conditioning(t3_cond)  # (B, len_cond, dim)
         text_emb = self.text_emb(text_tokens)  # (B, len_text, dim)
         if cfg_weight > 0.0:
-            text_emb[1].zero_()  # CFG uncond
+            # CFG uncond path
+            text_emb[1].zero_()
 
-        speech_emb = self.speech_emb(speech_tokens)  # (B, len_speech, dim)
+        speech_emb = self.speech_emb(speech_tokens) # (B, len_speech, dim
         if self.hp.input_pos_emb == "learned":
             text_emb = text_emb + self.text_pos_emb(text_tokens)
             speech_emb = speech_emb + self.speech_pos_emb(speech_tokens)
         len_cond = cond_emb.size(1)
 
         if cond_emb.size(0) != text_emb.size(0):
-             cond_emb = cond_emb.expand(text_emb.size(0), -1, -1)
+            cond_emb = cond_emb.expand(text_emb.size(0), -1, -1)
 
-        # concat
-        embeds = torch.stack([
-            torch.cat((ce, te, se))
-            for ce, te, se in zip(cond_emb, text_emb, speech_emb)
-        ])  # (B, length, dim)
+        embeds = torch.stack(
+            [torch.cat((ce, te, se)) for ce, te, se in zip(cond_emb, text_emb, speech_emb)]
+        )
         return embeds, len_cond
 
     def forward(
@@ -140,7 +147,7 @@ class T3(nn.Module):
             return_dict=True,
             use_cache=(not training),
         )
-        hidden_states = tfmr_out.hidden_states[-1]  # final tfmr layer output, (B, seq, dim)
+        hidden_states = tfmr_out.hidden_states[-1] # final tfmr layer output, (B, seq, dim
 
         # post-processing: splice out text and speech parts of hidden states
         len_text = text_tokens.size(1)
@@ -150,6 +157,7 @@ class T3(nn.Module):
         text_latents = torch.zeros(B, len_text, dim, dtype=dtype, device=device)
         speech_latents = torch.zeros(B, len_speech, dim, dtype=dtype, device=device)
         ttl, stl = text_token_lens, speech_token_lens
+
         for i in range(B):
             text_end = len_cond + ttl[i].item()
             speech_start = len_cond + text_tokens.size(1)
@@ -228,18 +236,75 @@ class T3(nn.Module):
         repetition_penalty=1.2,
         cfg_weight=0.5,
     ):
-        """
-        Args:
-            text_tokens: a 1D (unbatched) or 2D (batched) tensor.
-        """
-        # Validate / sanitize inputs
+        # Serialize inference for multilingual models to prevent hook interference
+        if self._multilingual_inference_lock is not None:
+            with self._multilingual_inference_lock:
+                return self._inference_impl(
+                    t3_cond=t3_cond,
+                    text_tokens=text_tokens,
+                    initial_speech_tokens=initial_speech_tokens,
+                    prepend_prompt_speech_tokens=prepend_prompt_speech_tokens,
+                    num_return_sequences=num_return_sequences,
+                    max_new_tokens=max_new_tokens,
+                    stop_on_eos=stop_on_eos,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                    min_p=min_p,
+                    length_penalty=length_penalty,
+                    repetition_penalty=repetition_penalty,
+                    cfg_weight=cfg_weight,
+                )
+        else:
+            # Non-multilingual models can run concurrently
+            return self._inference_impl(
+                t3_cond=t3_cond,
+                text_tokens=text_tokens,
+                initial_speech_tokens=initial_speech_tokens,
+                prepend_prompt_speech_tokens=prepend_prompt_speech_tokens,
+                num_return_sequences=num_return_sequences,
+                max_new_tokens=max_new_tokens,
+                stop_on_eos=stop_on_eos,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+                length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
+                cfg_weight=cfg_weight,
+            )
+
+    def _inference_impl(
+        self,
+        *,
+        t3_cond: T3Cond,
+        text_tokens: Tensor,
+        initial_speech_tokens: Optional[Tensor]=None,
+        prepend_prompt_speech_tokens: Optional[Tensor]=None,
+        num_return_sequences=1,
+        max_new_tokens=None,
+        stop_on_eos=True,
+        do_sample=True,
+        temperature=0.8,
+        top_p=0.95,
+        min_p=0.05,
+        length_penalty=1.0,
+        repetition_penalty=1.2,
+        cfg_weight=0.5,
+    ):
+        """Internal implementation of inference - either called with or without lock"""
         assert prepend_prompt_speech_tokens is None, "not implemented"
         _ensure_BOT_EOT(text_tokens, self.hp)
         text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
 
-        # Default initial speech to a single start-of-speech token
         if initial_speech_tokens is None:
-            initial_speech_tokens = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+            initial_speech_tokens = (
+                self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+            )
+
+        # Clone all input tensors to ensure complete isolation from caller's state
+        text_tokens = text_tokens.clone()
+        initial_speech_tokens = initial_speech_tokens.clone()
 
         # Prepare custom input embeds
         embeds, len_cond = self.prepare_input_embeds(
@@ -249,146 +314,126 @@ class T3(nn.Module):
             cfg_weight=cfg_weight,
         )
 
-        # In order to use the standard HF generate method, we need to extend some methods to inject our custom logic
-        # Note the llama-specific logic. Other tfmr types can be added later.
-
-        self.compiled = False
-
-        # TODO? synchronize the expensive compile function
-        # with self.compile_lock:
-        if not self.compiled:
-            # Default to None for English models, only create for multilingual
-            alignment_stream_analyzer = None
-            if self.hp.is_multilingual:
-                alignment_stream_analyzer = AlignmentStreamAnalyzer(
-                    self.tfmr,
-                    None,
-                    text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
-                    alignment_layer_idx=9, # TODO: hparam or something?
-                    eos_idx=self.hp.stop_speech_token,
-                )
-                assert alignment_stream_analyzer.eos_idx == self.hp.stop_speech_token
-
-            patched_model = T3HuggingfaceBackend(
-                config=self.cfg,
-                llama=self.tfmr,
-                speech_enc=self.speech_emb,
-                speech_head=self.speech_head,
-                alignment_stream_analyzer=alignment_stream_analyzer,
-            )
-            self.patched_model = patched_model
-            self.compiled = True
-
-        # # Run normal generate method, which calls our custom extended methods
-        # return self.patched_model.generate(
-        #     inputs=initial_speech_tokens,
-        #     decoder_cond=embeds,
-        #     bos_token_id=self.hp.start_speech_token,
-        #     eos_token_id=(self.hp.stop_speech_token if stop_on_eos else -1),
-        #     pad_token_id=self.hp.stop_speech_token,
-        #     max_new_tokens=max_new_tokens or self.hp.max_speech_tokens,
-        #     num_return_sequences=num_return_sequences,
-        #     temperature=temperature,
-        #     min_p=min_p,
-        #     length_penalty=length_penalty,
-        #     repetition_penalty=repetition_penalty,
-        #     do_sample=do_sample,
-        #     # cache_implementation=None if not self.compiled else "static",
-        # )
-
         device = embeds.device
 
+        # build a backend tied to THIS request's shapes
+        # AlignmentStreamAnalyzer and patched_model are created per-request for thread safety
+        alignment_stream_analyzer = None
+        if self.hp.is_multilingual:
+            alignment_stream_analyzer = AlignmentStreamAnalyzer(
+                self.tfmr,
+                None,
+                text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
+                alignment_layer_idx=9,
+                eos_idx=self.hp.stop_speech_token,
+            )
+
+        patched_model = T3HuggingfaceBackend(
+            config=self.cfg,
+            llama=self.tfmr,
+            speech_enc=self.speech_emb,
+            speech_head=self.speech_head,
+            alignment_stream_analyzer=alignment_stream_analyzer,
+        )
+
         bos_token = torch.tensor([[self.hp.start_speech_token]], dtype=torch.long, device=device)
-        bos_embed = self.speech_emb(bos_token)  # shape: (B, 1, embed_dim)
+        bos_embed = self.speech_emb(bos_token)
         bos_embed = bos_embed + self.speech_pos_emb.get_fixed_embedding(0)
+        bos_embed = torch.cat([bos_embed, bos_embed])  # CFG
 
-        # batch_size=2 for CFG
-        bos_embed = torch.cat([bos_embed, bos_embed])
-
-        # Combine condition and BOS token for the initial input
         inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
 
-        # Track generated token ids; start with the BOS token.
         generated_ids = bos_token.clone()
-        predicted = []  # To store the predicted tokens
+        predicted = []
 
-        # Instantiate the logits processors.
         top_p_warper = TopPLogitsWarper(top_p=top_p)
         min_p_warper = MinPLogitsWarper(min_p=min_p)
-        top_p_warper = TopPLogitsWarper(top_p=top_p)
-        repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
+        repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(
+            penalty=float(repetition_penalty)
+        )
 
-        # ---- Initial Forward Pass (no kv_cache yet) ----
-        output = self.patched_model(
+        output = patched_model(
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
-            output_attentions=True,
-            output_hidden_states=True,
+            output_attentions=False,
+            output_hidden_states=False,
             return_dict=True,
         )
-        # Initialize kv_cache with the full context.
         past = output.past_key_values
 
-        # ---- Generation Loop using kv_cache ----
-        for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
-            logits_step = output.logits[:, -1, :]                
-            # CFG combine  → (1, V)
-            cond   = logits_step[0:1, :]
+        max_steps = max_new_tokens or self.hp.max_speech_tokens
+
+        for i in tqdm(range(max_steps), desc="Sampling", dynamic_ncols=True):
+            logits_step = output.logits[:, -1, :]
+
+            # CFG
+            cond = logits_step[0:1, :]
             uncond = logits_step[1:2, :]
             cfg = torch.as_tensor(cfg_weight, device=cond.device, dtype=cond.dtype)
             logits = cond + cfg * (cond - uncond)
-            
-            # Apply alignment stream analyzer integrity checks
-            if self.patched_model.alignment_stream_analyzer is not None:
-                if logits.dim() == 1:            # guard in case something upstream squeezed
-                    logits = logits.unsqueeze(0) # (1, V)
-                # Pass the last generated token for repetition tracking
-                last_token = generated_ids[0, -1].item() if len(generated_ids[0]) > 0 else None
-                logits = self.patched_model.alignment_stream_analyzer.step(logits, next_token=last_token)  # (1, V)
 
-            # Apply repetition penalty
-            ids_for_proc = generated_ids[:1, ...]   # batch = 1
-            logits = repetition_penalty_processor(ids_for_proc, logits)  # expects (B,V)
-            
-            # Apply temperature scaling.
+            if patched_model.alignment_stream_analyzer is not None:
+                if logits.dim() == 1:
+                    logits = logits.unsqueeze(0)
+                last_token = generated_ids[0, -1].item() if generated_ids.size(1) > 0 else None
+                logits = patched_model.alignment_stream_analyzer.step(
+                    logits, next_token=last_token
+                )
+
+            ids_for_proc = generated_ids[:1, ...]
+            logits = repetition_penalty_processor(ids_for_proc, logits)
+
             if temperature != 1.0:
                 logits = logits / temperature
-                
-            # Apply min_p and top_p filtering
             logits = min_p_warper(ids_for_proc, logits)
             logits = top_p_warper(ids_for_proc, logits)
 
-            # Convert logits to probabilities and sample the next token.
             probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
+            next_token = torch.multinomial(probs, num_samples=1)
 
             predicted.append(next_token)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
-            # Check for EOS token.
             if next_token.view(-1) == self.hp.stop_speech_token:
                 logger.info(f"✅ EOS token detected! Stopping generation at step {i+1}")
                 break
 
-            # Get embedding for the new token.
             next_token_embed = self.speech_emb(next_token)
             next_token_embed = next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
-
-            #  For CFG
             next_token_embed = torch.cat([next_token_embed, next_token_embed])
 
-            # Forward pass with only the new token and the cached past.
-            output = self.patched_model(
+            output = patched_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
-                output_attentions=True,
-                output_hidden_states=True,
+                output_attentions=False,
+                output_hidden_states=False,
                 return_dict=True,
             )
-            # Update the kv_cache.
             past = output.past_key_values
 
-        # Concatenate all predicted tokens along the sequence dimension.
-        predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
+        try:
+            predicted_tokens = torch.cat(predicted, dim=1)
+        except Exception as e:
+            logger.error(f"Error concatenating predicted tokens. predicted length: {len(predicted)}")
+            logger.error(f"predicted contents: {[type(p) for p in predicted[:5]]}")  # First 5 items
+            raise RuntimeError(f"Failed to concatenate predicted tokens: {e}") from e
+
+        # Comprehensive cleanup to prevent memory leaks
+        del predicted
+        del generated_ids
+        del past
+        del output
+        del patched_model
+        if alignment_stream_analyzer is not None:
+            # Remove hooks to prevent interference with concurrent requests
+            alignment_stream_analyzer.cleanup()
+            del alignment_stream_analyzer
+        del embeds
+        del inputs_embeds
+        del bos_embed
+        del bos_token
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return predicted_tokens

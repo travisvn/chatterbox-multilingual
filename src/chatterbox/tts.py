@@ -180,19 +180,24 @@ class ChatterboxTTS:
         return cls.from_local(Path(local_path).parent, device)
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
-        ## Load reference wav
+        """
+        Build conditionals from a reference wav and return them.
+        Also stores them on self for backwards compatibility, but callers
+        should prefer using the returned value to avoid cross-request clashes.
+        """
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
-
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
         s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
         s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
 
         # Speech cond prompt tokens
-        if plen := self.t3.hp.speech_cond_prompt_len:
+        if (plen := self.t3.hp.speech_cond_prompt_len):
             s3_tokzr = self.s3gen.tokenizer
             t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
             t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+        else:
+            t3_cond_prompt_tokens = None
 
         # Voice-encoder speaker embedding
         ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
@@ -203,7 +208,8 @@ class ChatterboxTTS:
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+
+        return Conditionals(t3_cond, s3gen_ref_dict)
 
     def generate(
         self,
@@ -216,15 +222,21 @@ class ChatterboxTTS:
         cfg_weight=0.5,
         temperature=0.8,
     ):
+        # per-request conditionals
         if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            conds = self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            # Clone t3 conds to prevent cross-request contamination
+            conds = Conditionals(
+                t3=self.conds.t3.clone(),
+                gen={k: v.clone() if torch.is_tensor(v) else v for k, v in self.conds.gen.items()},
+            )
 
         # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond: T3Cond = self.conds.t3
-            self.conds.t3 = T3Cond(
+        if exaggeration != conds.t3.emotion_adv[0, 0, 0]:
+            _cond: T3Cond = conds.t3
+            conds.t3 = T3Cond(
                 speaker_emb=_cond.speaker_emb,
                 cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
                 emotion_adv=exaggeration * torch.ones(1, 1, 1),
@@ -235,7 +247,7 @@ class ChatterboxTTS:
         text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
 
         if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0) # Need two seqs for CFG
 
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
@@ -244,9 +256,9 @@ class ChatterboxTTS:
 
         with torch.inference_mode():
             speech_tokens = self.t3.inference(
-                t3_cond=self.conds.t3,
+                t3_cond=conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=1000,  # TODO: use the value in config
+                max_new_tokens=1000,  # TODO: expose/configure
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 repetition_penalty=repetition_penalty,
@@ -258,14 +270,12 @@ class ChatterboxTTS:
 
             # TODO: output becomes 1D
             speech_tokens = drop_invalid_tokens(speech_tokens)
-            
             speech_tokens = speech_tokens[speech_tokens < 6561]
-
             speech_tokens = speech_tokens.to(self.device)
 
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
+                ref_dict=conds.gen,
             )
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)

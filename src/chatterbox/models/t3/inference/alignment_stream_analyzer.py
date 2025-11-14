@@ -60,9 +60,11 @@ class AlignmentStreamAnalyzer:
         # using it for all layers slows things down too much. We can apply it to just one layer
         # by intercepting the kwargs and adding a forward hook (credit: jrm)
         self.last_aligned_attns = []
+        self.hook_handles = []  # Store hook handles so we can remove them later
         for i, (layer_idx, head_idx) in enumerate(LLAMA_ALIGNED_HEADS):
             self.last_aligned_attns += [None]
-            self._add_attention_spy(tfmr, i, layer_idx, head_idx)
+            hook_handle = self._add_attention_spy(tfmr, i, layer_idx, head_idx)
+            self.hook_handles.append(hook_handle)
 
     def _add_attention_spy(self, tfmr, buffer_idx, layer_idx, head_idx):
         """
@@ -80,11 +82,21 @@ class AlignmentStreamAnalyzer:
                 self.last_aligned_attns[buffer_idx] = step_attention[0, head_idx]  # (T0, Ti)
 
         target_layer = tfmr.layers[layer_idx].self_attn
-        # Register hook and store the handle
-        target_layer.register_forward_hook(attention_forward_hook)
-        if hasattr(tfmr, 'config') and hasattr(tfmr.config, 'output_attentions'):
-            self.original_output_attentions = tfmr.config.output_attentions
-            tfmr.config.output_attentions = True
+        # Register hook and return the handle so we can remove it later
+        hook_handle = target_layer.register_forward_hook(attention_forward_hook)
+        # NOTE: We don't set tfmr.config.output_attentions = True here because:
+        # 1. It affects the global config and all forward passes
+        # 2. It causes memory overhead for all layers, not just the one we're hooking
+        # 3. The hook should work without it since we're intercepting the layer output directly
+        return hook_handle
+
+    def cleanup(self):
+        """
+        Remove all registered hooks to prevent memory leaks and interference with other requests.
+        """
+        for hook_handle in self.hook_handles:
+            hook_handle.remove()
+        self.hook_handles.clear()
 
     def step(self, logits, next_token=None):
         """

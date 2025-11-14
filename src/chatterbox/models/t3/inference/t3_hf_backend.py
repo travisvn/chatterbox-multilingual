@@ -76,7 +76,7 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         past_key_values: Optional[torch.Tensor]=None,
         use_cache=True,
         output_attentions=False,
-        output_hidden_states=True,
+        output_hidden_states=False,
         return_dict=True,
     ):
         """
@@ -90,14 +90,16 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         has_cache = past_key_values is not None and len(past_key_values) > 0
         assert not (is_large_input and has_cache)
         assert return_dict
-        assert output_hidden_states
 
+        # Always request hidden_states internally to get the final layer output for computing logits
+        # Request attentions only if AlignmentStreamAnalyzer is present (multilingual mode)
+        need_attentions = self.alignment_stream_analyzer is not None
         tfmr_out = self.model(
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_attentions=need_attentions,  # Only output for alignment analysis
+            output_hidden_states=True,  # Need this to get final layer output for logits
             return_dict=True,
         )
         hidden_states = tfmr_out.hidden_states[-1]  # (B, seq, dim)
@@ -108,9 +110,12 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         # NOTE: hallucination handler may modify logits to force emit an EOS token
         # logits = self.alignment_stream_analyzer.step(logits)
 
+        # Only return what the caller actually requested to avoid memory leaks
+        # We computed hidden_states internally but don't need to return the full list
+        # Return attentions only if AlignmentStreamAnalyzer needs them (multilingual mode)
         return CausalLMOutputWithCrossAttentions(
             logits=logits,
             past_key_values=tfmr_out.past_key_values,
-            hidden_states=tfmr_out.hidden_states,
-            attentions=tfmr_out.attentions,
+            hidden_states=None,  # Don't return all layers, saves memory
+            attentions=tfmr_out.attentions if need_attentions else None,
         )

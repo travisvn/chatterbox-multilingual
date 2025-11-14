@@ -21,6 +21,16 @@ class T3Cond:
     cond_prompt_speech_emb: Optional[Tensor] = None
     emotion_adv: Optional[Tensor] = 0.5
 
+    def clone(self):
+        "Create a deep copy with cloned tensors to prevent memory leaks."
+        return T3Cond(
+            speaker_emb=self.speaker_emb.clone() if torch.is_tensor(self.speaker_emb) else self.speaker_emb,
+            clap_emb=self.clap_emb.clone() if torch.is_tensor(self.clap_emb) else self.clap_emb,
+            cond_prompt_speech_tokens=self.cond_prompt_speech_tokens.clone() if torch.is_tensor(self.cond_prompt_speech_tokens) else self.cond_prompt_speech_tokens,
+            cond_prompt_speech_emb=self.cond_prompt_speech_emb.clone() if torch.is_tensor(self.cond_prompt_speech_emb) else self.cond_prompt_speech_emb,
+            emotion_adv=self.emotion_adv.clone() if torch.is_tensor(self.emotion_adv) else self.emotion_adv,
+        )
+
     def to(self, *, device=None, dtype=None):
         "Cast to a device and dtype. Dtype casting is ignored for long/int tensors."
         for k, v in self.__dict__.items():
